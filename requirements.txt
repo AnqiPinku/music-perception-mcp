@@ -1,0 +1,9 @@
+# music-perception-mcp -- audio analysis dependencies.
+# These live ONLY in this server's environment; the agent kernel and the other
+# MCP servers (reaper-mcp, system-mcp) stay zero-dependency. All permissive
+# licenses, pure pip, no external binary (no ffmpeg required).
+numpy>=1.23
+soundfile>=0.12      # libsndfile bindings -- WAV/FLAC/OGG/AIFF read (BSD)
+pyloudnorm>=0.1.1    # ITU-R BS.1770 integrated loudness (MIT)
+librosa>=0.10        # tempo / key / spectral features (ISC); pulls in scipy
+scipy>=1.9           # true-peak oversampling (BSD); also a librosa dep
