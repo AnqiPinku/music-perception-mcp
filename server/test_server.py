@@ -47,6 +47,7 @@ def main():
         [sys.executable, SERVER],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
         text=True, encoding="utf-8",
+        env=dict(os.environ, GEMINI_API_KEY=""),   # keep listen_subjective unconfigured
     )
     failures = []
 
@@ -64,8 +65,8 @@ def main():
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = {t["name"] for t in r["result"]["tools"]}
-        check("tools/list has analyze_audio + measure_loudness",
-              {"analyze_audio", "measure_loudness"} <= names)
+        check("tools/list has analyze_audio + measure_loudness + listen_subjective",
+              {"analyze_audio", "measure_loudness", "listen_subjective"} <= names)
 
         # measure_loudness
         r = rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -113,6 +114,14 @@ def main():
         r = rpc(proc, {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
                        "params": {"name": "nope", "arguments": {}}})
         check("unknown tool errors", "error" in r)
+
+        # listen_subjective degrades gracefully without a key (no network)
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                       "params": {"name": "listen_subjective",
+                                  "arguments": {"path": wav}}})
+        body = json.loads(r["result"]["content"][0]["text"])
+        check("listen_subjective without key -> configured:false",
+              body.get("configured") is False)
 
     finally:
         proc.stdin.close()

@@ -7,3 +7,8 @@ soundfile>=0.12      # libsndfile bindings -- WAV/FLAC/OGG/AIFF read (BSD)
 pyloudnorm>=0.1.1    # ITU-R BS.1770 integrated loudness (MIT)
 librosa>=0.10        # tempo / key / spectral features (ISC); pulls in scipy
 scipy>=1.9           # true-peak oversampling (BSD); also a librosa dep
+
+# --- listen_subjective (optional; the deterministic tools work without these) ---
+# Pick ONE backend for the audio-LLM tool:
+openai>=1.40         # for an OpenAI-compatible relay (PackyCode / OpenRouter) via GEMINI_BASE_URL
+# google-genai>=1.0  # for Google's native Gemini API (no GEMINI_BASE_URL)
