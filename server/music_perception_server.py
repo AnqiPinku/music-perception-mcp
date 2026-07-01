@@ -33,14 +33,38 @@ SERVER_VERSION = "0.1.0"
 # Audio loading
 # --------------------------------------------------------------------------
 def _load(path):
-    """Read an audio file to (samples, channels) float64 + sample rate."""
+    """Read an audio file to (samples, channels) float64 + sample rate.
+
+    Tolerant of trailing junk: many store-downloaded MP3s carry appended
+    tag/lyrics blocks that make libsndfile abort mid-stream. On a read error
+    we keep everything decoded so far (typically >99% of the audio), which is
+    plenty for analysis; only give up if nothing could be decoded at all.
+    """
     if not isinstance(path, str) or not path:
         raise ValueError("path is required")
     if not os.path.isfile(path):
         raise FileNotFoundError(f"audio file not found: {path}")
     import soundfile as sf  # lazy: keeps import errors close to the tool call
-    data, rate = sf.read(path, always_2d=True, dtype="float64")
-    return data, int(rate)
+    try:
+        data, rate = sf.read(path, always_2d=True, dtype="float64")
+        return data, int(rate)
+    except sf.LibsndfileError:
+        pass
+    import numpy as np
+    with sf.SoundFile(path) as f:
+        rate, blocks = f.samplerate, []
+        while True:
+            try:
+                b = f.read(65536, dtype="float64", always_2d=True)
+            except sf.LibsndfileError:
+                break                      # 尾部脏数据：保留已解码部分
+            if len(b) == 0:
+                break
+            blocks.append(b)
+    if not blocks:
+        raise ValueError(
+            "cannot decode this file (corrupt or unsupported encoding): " + path)
+    return np.concatenate(blocks), int(rate)
 
 
 # --------------------------------------------------------------------------
@@ -278,7 +302,10 @@ def _audio_b64(path):
     import io
     import librosa
     import soundfile as sf
-    y, _ = librosa.load(path, sr=16000, mono=True, duration=20.0)
+    data, rate = _load(path)          # 走容错加载（librosa.load 会被尾部脏数据搞挂）
+    y = data.mean(axis=1).astype("float32")[: int(rate * 20.0)]
+    if rate != 16000:
+        y = librosa.resample(y, orig_sr=rate, target_sr=16000)
     buf = io.BytesIO()
     sf.write(buf, y, 16000, format="WAV", subtype="PCM_16")
     return base64.b64encode(buf.getvalue()).decode()
@@ -343,20 +370,31 @@ def _llm_native(path, key, model, prompt, _base=None):
 # --------------------------------------------------------------------------
 # Audio -> MIDI  (monophonic, librosa pyin -- deterministic, offline)
 # --------------------------------------------------------------------------
-def transcribe_melody(path, bpm=None, quantize_beats=0.0, min_note_ms=80):
-    """Monophonic pitch tracking -> note list in BEATS, ready for a DAW MIDI tool."""
+def transcribe_melody(path, bpm=None, quantize_beats=0.0, min_note_ms=80,
+                      start_seconds=0.0, max_seconds=0.0):
+    """Monophonic pitch tracking -> note list in BEATS, ready for a DAW MIDI tool.
+
+    start_seconds/max_seconds 支持分段转录超长音频（0 = 整段）。输出的
+    start_beats 以被转录片段的开头为 0，agent 写回 DAW 时自行加偏移。
+    """
     import numpy as np
     import librosa
     data, rate = _load(path)
     mono = data.mean(axis=1).astype(np.float32)
-    if rate != 22050:                          # pyin 在 22050 足够准且快得多
-        mono = librosa.resample(mono, orig_sr=rate, target_sr=22050)
-        rate = 22050
+    if start_seconds:
+        mono = mono[int(float(start_seconds) * rate):]
+    if max_seconds:
+        mono = mono[: int(float(max_seconds) * rate)]
+    if mono.size < rate // 10:
+        raise ValueError("selected segment is empty or shorter than 0.1s")
+    if rate != 16000:                          # 16k + hop512：精度够、比 22k/256 快 ~3 倍
+        mono = librosa.resample(mono, orig_sr=rate, target_sr=16000)
+        rate = 16000
     if not bpm:
         t, _ = librosa.beat.beat_track(y=mono, sr=rate)
         bpm = float(np.atleast_1d(t)[0]) or 120.0
     bpm = float(bpm)
-    hop = 256                                  # ~11.6ms 帧移
+    hop = 512                                  # 32ms 帧移，120BPM 十六分=125ms，足够
     f0, voiced, _ = librosa.pyin(
         mono, fmin=float(librosa.note_to_hz("C1")),
         fmax=float(librosa.note_to_hz("C7")), sr=rate, hop_length=hop)
@@ -467,14 +505,21 @@ tool(
     "can write them straight into a track. Pass bpm = the DAW project tempo "
     "so beat positions line up (otherwise tempo is auto-detected). Optional "
     "quantize_beats snaps to a grid (0.25 = 16th notes; 0 = off). NOT for "
-    "chords, polyphony or drums -- results will be wrong.",
+    "chords, polyphony or drums -- results will be wrong. Speed: roughly 1s "
+    "per 5s of audio; for files over ~3 minutes transcribe in segments with "
+    "start_seconds/max_seconds (start_beats restarts at 0 for each segment -- "
+    "offset them yourself when writing to the DAW).",
     obj({"path": {"type": "string"},
          "bpm": {"type": "number"},
          "quantize_beats": {"type": "number"},
-         "min_note_ms": {"type": "number"}}, ["path"]),
+         "min_note_ms": {"type": "number"},
+         "start_seconds": {"type": "number"},
+         "max_seconds": {"type": "number"}}, ["path"]),
     lambda a: transcribe_melody(a["path"], a.get("bpm"),
                                 a.get("quantize_beats") or 0.0,
-                                a.get("min_note_ms") or 80),
+                                a.get("min_note_ms") or 80,
+                                a.get("start_seconds") or 0.0,
+                                a.get("max_seconds") or 0.0),
 )
 
 TOOL_INDEX = {t["name"]: t for t in TOOLS}
