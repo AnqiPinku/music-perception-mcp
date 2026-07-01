@@ -23,12 +23,14 @@ reaper-mcp, so prism-core's `mcp_client` connects to it identically.
 This server measures. The numbers are exact and reproducible (same file →
 same answer), computed by signal-processing libraries, **not** by an AI model.
 
-It deliberately does **not** make subjective judgements — "sounds muddy",
-"vocal is harsh", "the mood is sad". That perception is a *separate, later*
-tool (`listen_subjective`, backed by an audio LLM such as Gemini) and lives
-outside this v1 on purpose: the trustworthiness and use of "exact number" vs
-"opinion" are different, so they are kept apart. See the music-agent design
-docs for the two-layer plan.
+The deterministic tools (`analyze_audio`, `measure_loudness`) make **no**
+subjective judgement — no "muddy/harsh/sad". Those come from ONE clearly
+separated, non-deterministic tool, `listen_subjective`, backed by an audio LLM
+(Gemini). Exact numbers and opinions are kept apart on purpose — their
+trustworthiness and use differ. An empirical benchmark backs this split:
+deterministic MIR tracks controlled spectral defects perfectly (Spearman ρ≈1.0)
+while models don't (≤0.31); models judge mood/emotion decently (0.46–0.64 vs
+human DEAM ratings) while MIR is blind. See the music-agent design docs.
 
 ## Tools
 
@@ -57,6 +59,24 @@ Both take an **absolute path**, e.g. one returned by reaper-mcp's
 [libsndfile](http://libsndfile.github.io/libsndfile/)-readable format works
 (FLAC/OGG/AIFF). MP3/M4A are not guaranteed — render to WAV first.
 
+### `listen_subjective(path, question?)` — the one non-deterministic tool
+Holistic "listening" judgement via an audio LLM (Gemini): 0-100
+muddy/harsh/sibilant/bright, valence/arousal in [-10,10], a mood word,
+timestamped issues, a one-line overall. Optional `question` focuses it
+("is the vocal sibilant?"). Use it for mood / holistic feel; use `analyze_audio`
+for exact numbers.
+
+Needs a key — set env **before launching the server**:
+- `GEMINI_API_KEY` — required.
+- `GEMINI_BASE_URL` — optional; set it to use an **OpenAI-compatible relay**
+  (e.g. PackyCode `https://www.packyapi.com/v1`, or OpenRouter). Unset → Google's
+  native Gemini API.
+- `GEMINI_MODEL` — default `gemini-2.5-flash` (use `gemini-2.5-flash-lite` to save).
+
+Without a key it returns `{configured:false, error}` and the deterministic tools
+keep working. Install a backend: `pip install openai` (relay) or `google-genai`
+(native). It downsamples to 16 kHz mono, ≤20 s, before sending.
+
 ## Capabilities and boundaries
 
 What this server is good for — and where each number stops being trustworthy.
@@ -73,8 +93,9 @@ Read this before acting on a value.
 | **Clipping** | Detecting digital full-scale clipping | Full-scale only (≥0.999); soft/analog-style clipping and inter-sample overs are **not** here — those show up as a high `true_peak_dbtp` |
 
 Cross-cutting:
-- **Measurement, not opinion.** No "muddy/harsh/sad" — that's the future
-  subjective layer.
+- **Measurement vs opinion.** The deterministic tools give exact numbers;
+  `listen_subjective` gives the opinions ("muddy/harsh/sad") — separately, and
+  non-deterministically.
 - **Garbage in, garbage out.** Feed it the actual render. The numbers describe
   exactly the file you pass, including its sample rate and channel layout.
 - **One global answer per file** for tempo/key. For per-section analysis,
@@ -110,10 +131,8 @@ and the other MCP servers stay zero-dependency. Notably this avoids
 `madmom` (non-commercial model weights) and `Essentia` (AGPL), so the stack
 stays commercial-friendly.
 
-## Roadmap (not in v1)
+## Roadmap
 
 - `separate_stems(path)` — Demucs source separation (heavy; CPU-slow). Lets you
   measure each instrument's loudness/masking.
-- `listen_subjective(path, question?)` — the subjective layer (audio LLM /
-  Gemini): "does this sound muddy / harsh / what's the mood". Returns opinion
-  JSON, kept separate from the exact numbers above.
+- (done) `listen_subjective` — the subjective/mood layer, see above.

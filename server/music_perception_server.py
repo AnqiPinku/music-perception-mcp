@@ -247,6 +247,100 @@ def analyze_audio(path):
 
 
 # --------------------------------------------------------------------------
+# Subjective listening (LLM) -- the ONLY non-deterministic, network tool.
+# Backends: native google-genai, OR any OpenAI-compatible relay (PackyCode /
+# OpenRouter / ...) via GEMINI_BASE_URL. Unconfigured -> clear error, never a
+# crash; the deterministic tools never depend on this.
+# --------------------------------------------------------------------------
+_LLM_PROMPT = (
+    "You are a mastering engineer. Listen to this music and judge the MIX SOUND "
+    "(not the composition). Give 0-100 scores: muddy (low-mid 200-500Hz boom), "
+    "harsh (aggressive 2-8kHz), sibilant (harsh ess 5-9kHz), bright "
+    "(treble-forward). Give valence and arousal in [-10,10]. Give a one-word "
+    "mood. List timestamped problem spots in issues. One-sentence overall.")
+_LLM_JSON = (
+    ' Respond with ONLY a JSON object, no prose or code fence: '
+    '{"muddy":int,"harsh":int,"sibilant":int,"bright":int,"valence":number,'
+    '"arousal":number,"mood":string,'
+    '"issues":[{"t_seconds":number,"desc":string}],"overall":string}')
+
+
+def _parse_json(txt):
+    import re
+    if not txt:
+        raise ValueError("empty response from model")
+    m = re.search(r"\{.*\}", txt, re.S)
+    return json.loads(m.group(0) if m else txt)
+
+
+def _audio_b64(path):
+    import base64
+    import io
+    import librosa
+    import soundfile as sf
+    y, _ = librosa.load(path, sr=16000, mono=True, duration=20.0)
+    buf = io.BytesIO()
+    sf.write(buf, y, 16000, format="WAV", subtype="PCM_16")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def listen_subjective(path, question=None):
+    """Holistic/mood judgement of a mix via an audio LLM (Gemini)."""
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return {"configured": False,
+                "error": "listen_subjective not configured. Set GEMINI_API_KEY "
+                "(+ optional GEMINI_BASE_URL for an OpenAI-compatible relay such "
+                "as PackyCode/OpenRouter, and GEMINI_MODEL). The deterministic "
+                "tools (analyze_audio / measure_loudness) work without it."}
+    if not os.path.isfile(path):
+        raise FileNotFoundError("audio file not found: " + path)
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    focus = (" Focus especially on: " + question) if question else ""
+    prompt = _LLM_PROMPT + focus + _LLM_JSON
+    base = os.environ.get("GEMINI_BASE_URL")
+    return (_llm_relay if base else _llm_native)(path, key, model, prompt, base)
+
+
+def _llm_relay(path, key, model, prompt, base_url):
+    import time
+    from openai import OpenAI
+    client = OpenAI(base_url=base_url, api_key=key)
+    b64 = _audio_b64(path)
+    msgs = [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}}]}]
+    last = None
+    for attempt in range(4):                       # thinking model needs headroom
+        try:
+            r = client.chat.completions.create(model=model, max_tokens=1500, messages=msgs)
+            return _parse_json(r.choices[0].message.content)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(2 ** attempt)
+    raise last
+
+
+def _llm_native(path, key, model, prompt, _base=None):
+    import time
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=key)
+    last = None
+    for attempt in range(4):
+        try:
+            up = client.files.upload(file=path)
+            r = client.models.generate_content(
+                model=model, contents=[prompt, up],
+                config=types.GenerateContentConfig(response_mime_type="application/json"))
+            return _parse_json(r.text)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(2 ** attempt)
+    raise last
+
+
+# --------------------------------------------------------------------------
 # Tool registry
 # --------------------------------------------------------------------------
 TOOLS = []
@@ -283,6 +377,20 @@ tool(
     "loudness checks against a target (e.g. -14 LUFS).",
     obj({"path": {"type": "string"}}, ["path"]),
     lambda a: measure_loudness(a["path"]),
+)
+
+tool(
+    "listen_subjective",
+    "Subjective 'listening' judgement of a mix via an audio LLM (Gemini): "
+    "0-100 muddy/harsh/sibilant/bright, valence/arousal in [-10,10], a mood "
+    "word, timestamped issues, and a one-line overall. The ONLY non-"
+    "deterministic, network tool -- needs GEMINI_API_KEY (+ optional "
+    "GEMINI_BASE_URL for an OpenAI-compatible relay like PackyCode/OpenRouter, "
+    "GEMINI_MODEL). Use it for holistic / mood judgement; use analyze_audio for "
+    "exact spectral numbers. Optional 'question' focuses it (e.g. 'is the vocal "
+    "sibilant?'). Returns {configured:false, error} if no key is set.",
+    obj({"path": {"type": "string"}, "question": {"type": "string"}}, ["path"]),
+    lambda a: listen_subjective(a["path"], a.get("question")),
 )
 
 TOOL_INDEX = {t["name"]: t for t in TOOLS}
