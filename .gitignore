@@ -8,3 +8,8 @@ venv/
 tmp/
 data/tmp/
 .DS_Store
+
+# PyInstaller sidecar build artifacts (packaging/build_sidecar.py)
+/dist/
+/build/
+*.spec

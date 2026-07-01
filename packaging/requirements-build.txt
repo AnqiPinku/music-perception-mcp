@@ -1,0 +1,12 @@
+# Clean-venv deps to FREEZE the perception sidecar. Install ONLY these (no torch/
+# transformers/matplotlib) so PyInstaller doesn't drag research junk into the bundle.
+#   python -m venv venv
+#   venv/Scripts/pip install -r packaging/requirements-build.txt
+#   venv/Scripts/python packaging/build_sidecar.py
+numpy>=1.23
+scipy>=1.9
+soundfile>=0.12
+pyloudnorm>=0.1.1
+librosa>=0.10
+openai>=1.40
+pyinstaller>=6.0
