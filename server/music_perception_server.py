@@ -341,6 +341,71 @@ def _llm_native(path, key, model, prompt, _base=None):
 
 
 # --------------------------------------------------------------------------
+# Audio -> MIDI  (monophonic, librosa pyin -- deterministic, offline)
+# --------------------------------------------------------------------------
+def transcribe_melody(path, bpm=None, quantize_beats=0.0, min_note_ms=80):
+    """Monophonic pitch tracking -> note list in BEATS, ready for a DAW MIDI tool."""
+    import numpy as np
+    import librosa
+    data, rate = _load(path)
+    mono = data.mean(axis=1).astype(np.float32)
+    if rate != 22050:                          # pyin 在 22050 足够准且快得多
+        mono = librosa.resample(mono, orig_sr=rate, target_sr=22050)
+        rate = 22050
+    if not bpm:
+        t, _ = librosa.beat.beat_track(y=mono, sr=rate)
+        bpm = float(np.atleast_1d(t)[0]) or 120.0
+    bpm = float(bpm)
+    hop = 256                                  # ~11.6ms 帧移
+    f0, voiced, _ = librosa.pyin(
+        mono, fmin=float(librosa.note_to_hz("C1")),
+        fmax=float(librosa.note_to_hz("C7")), sr=rate, hop_length=hop)
+    rms = librosa.feature.rms(y=mono, hop_length=hop)[0]
+    times = librosa.frames_to_time(np.arange(len(f0)), sr=rate, hop_length=hop)
+    midi_f = librosa.hz_to_midi(np.where(np.isfinite(f0), f0, 1.0))
+    ok = np.asarray(voiced) & np.isfinite(f0)
+
+    # 连续有声帧 + 音高稳定(相对段中位数 <0.7 半音,容纳颤音) => 一个音符
+    segs, i, n = [], 0, len(f0)
+    min_frames = max(2, int((min_note_ms / 1000.0) * rate / hop))
+    while i < n:
+        if not ok[i]:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and ok[j] and abs(midi_f[j] - float(np.median(midi_f[i:j]))) < 0.7:
+            j += 1
+        if j - i >= min_frames:
+            segs.append((i, j))
+        i = j
+    notes = []
+    if segs:
+        seg_db = [20 * np.log10(float(rms[a:b].mean()) + 1e-9) for a, b in segs]
+        lo, hi = min(seg_db), max(seg_db)
+        span = (hi - lo) or 1.0
+        for (a, b), db in zip(segs, seg_db):
+            pitch = int(round(float(np.median(midi_f[a:b]))))
+            if not 0 <= pitch <= 127:
+                continue
+            start_b = float(times[a]) * bpm / 60.0
+            len_b = (float(times[min(b, n - 1)]) - float(times[a])) * bpm / 60.0
+            if quantize_beats:                 # 吸附到节拍网格(如 0.25 = 十六分)
+                q = float(quantize_beats)
+                start_b = round(start_b / q) * q
+                len_b = max(q, round(len_b / q) * q)
+            notes.append({"pitch": pitch,
+                          "start_beats": round(start_b, 3),
+                          "length_beats": round(max(len_b, 0.05), 3),
+                          "velocity": int(round(64 + 48 * (db - lo) / span))})
+    return {"file": os.path.abspath(path), "bpm_used": round(bpm, 1),
+            "note_count": len(notes), "notes": notes[:1000],
+            "voiced_pct": round(float(ok.mean()) * 100, 1),
+            "method": "librosa.pyin (monophonic)",
+            "note": "single-voice melody/bass only -- chords and drums will "
+                    "come out wrong; pass the DAW project BPM so beats line up"}
+
+
+# --------------------------------------------------------------------------
 # Tool registry
 # --------------------------------------------------------------------------
 TOOLS = []
@@ -391,6 +456,25 @@ tool(
     "sibilant?'). Returns {configured:false, error} if no key is set.",
     obj({"path": {"type": "string"}, "question": {"type": "string"}}, ["path"]),
     lambda a: listen_subjective(a["path"], a.get("question")),
+)
+
+tool(
+    "transcribe_melody",
+    "Transcribe a MONOPHONIC audio file (melody, bassline, hummed idea, single "
+    "synth line) into MIDI-ready notes via deterministic pitch tracking "
+    "(librosa pyin). Returns notes as {pitch, start_beats, length_beats, "
+    "velocity} -- the exact shape reaper-mcp's add_midi_notes expects, so you "
+    "can write them straight into a track. Pass bpm = the DAW project tempo "
+    "so beat positions line up (otherwise tempo is auto-detected). Optional "
+    "quantize_beats snaps to a grid (0.25 = 16th notes; 0 = off). NOT for "
+    "chords, polyphony or drums -- results will be wrong.",
+    obj({"path": {"type": "string"},
+         "bpm": {"type": "number"},
+         "quantize_beats": {"type": "number"},
+         "min_note_ms": {"type": "number"}}, ["path"]),
+    lambda a: transcribe_melody(a["path"], a.get("bpm"),
+                                a.get("quantize_beats") or 0.0,
+                                a.get("min_note_ms") or 80),
 )
 
 TOOL_INDEX = {t["name"]: t for t in TOOLS}
