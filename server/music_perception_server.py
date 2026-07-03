@@ -329,6 +329,16 @@ def listen_subjective(path, question=None):
     return (_llm_relay if base else _llm_native)(path, key, model, prompt, base)
 
 
+def _raise_retries_exhausted(errors):
+    """把每次失败的类型 + 首行都放进最终错误——不再只见到最后一条(可能是"empty response")
+    掩盖真正的连接失败。debug 时能立刻看到:是 429?超时?empty response?"""
+    parts = ["%d 次尝试全部失败:" % len(errors)]
+    for i, (etype, emsg, _exc) in enumerate(errors, 1):
+        head = str(emsg).splitlines()[0][:200] if emsg else ""
+        parts.append("  attempt %d: %s: %s" % (i, etype, head))
+    raise RuntimeError("\n".join(parts)) from errors[-1][2]
+
+
 def _llm_relay(path, key, model, prompt, base_url):
     import time
     from openai import OpenAI
@@ -337,15 +347,16 @@ def _llm_relay(path, key, model, prompt, base_url):
     msgs = [{"role": "user", "content": [
         {"type": "text", "text": prompt},
         {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}}]}]
-    last = None
+    errors = []
     for attempt in range(4):                       # thinking model needs headroom
         try:
             r = client.chat.completions.create(model=model, max_tokens=1500, messages=msgs)
             return _parse_json(r.choices[0].message.content)
         except Exception as e:  # noqa: BLE001
-            last = e
-            time.sleep(2 ** attempt)
-    raise last
+            errors.append((type(e).__name__, str(e), e))
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+    _raise_retries_exhausted(errors)
 
 
 def _llm_native(path, key, model, prompt, _base=None):
@@ -353,7 +364,7 @@ def _llm_native(path, key, model, prompt, _base=None):
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=key)
-    last = None
+    errors = []
     for attempt in range(4):
         try:
             up = client.files.upload(file=path)
@@ -362,9 +373,10 @@ def _llm_native(path, key, model, prompt, _base=None):
                 config=types.GenerateContentConfig(response_mime_type="application/json"))
             return _parse_json(r.text)
         except Exception as e:  # noqa: BLE001
-            last = e
-            time.sleep(2 ** attempt)
-    raise last
+            errors.append((type(e).__name__, str(e), e))
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+    _raise_retries_exhausted(errors)
 
 
 # --------------------------------------------------------------------------
