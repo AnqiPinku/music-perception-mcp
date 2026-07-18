@@ -73,6 +73,8 @@ def _load(path):
 def _loudness(data, rate):
     import numpy as np
     out = {"integrated_lufs": None, "loudness_range_lu": None,
+           "short_term_max_lufs": None, "momentary_max_lufs": None,
+           "short_term_series": None,
            "true_peak_dbtp": None, "sample_peak_db": None}
 
     sp = float(np.max(np.abs(data))) if data.size else 0.0
@@ -100,42 +102,68 @@ def _loudness(data, rate):
     except Exception:
         pass
 
-    # Loudness range (EBU R128 / Tech 3342): gated P95-P10 of short-term loudness.
+    # BS.1770 的三个时间尺度共享一次 K 加权：
+    #   short-term (3s/1s) 序列 -> LRA 门限统计 + 峰值 + 时间序列（定位"哪几秒过响"）
+    #   momentary (400ms/100ms)  -> 只出峰值（整条序列太长，对模型无增量价值）
     try:
-        out["loudness_range_lu"] = _loudness_range(data, rate)
+        x, g = _kweighted(data, rate)
+        if x is not None:
+            times, st = _windowed_loudness(x, g, rate, 3.0, 1.0)
+            out["loudness_range_lu"] = _lra_from_series(st)
+            if st:
+                out["short_term_max_lufs"] = round(max(st), 2)
+                stride = max(1, -(-len(st) // 240))   # 序列最多 ~240 点
+                out["short_term_series"] = {
+                    "window_s": 3.0, "hop_s": 1.0 * stride,
+                    "points": [[round(times[i], 1), round(st[i], 2)]
+                               for i in range(0, len(st), stride)],
+                }
+            _, mom = _windowed_loudness(x, g, rate, 0.4, 0.1)
+            if mom:
+                out["momentary_max_lufs"] = round(max(mom), 2)
     except Exception:
-        out["loudness_range_lu"] = None
+        pass
 
     return out
 
 
-def _loudness_range(data, rate):
-    """EBU R128 loudness range from 3s short-term windows (1s hop), gated.
-
-    Reuses pyloudnorm's K-weighting filters; returns None if unavailable."""
+def _kweighted(data, rate):
+    """K 加权信号 + 声道增益（BS.1770），LRA / short-term / momentary 共用一次。"""
     import numpy as np
     import pyloudnorm as pyln
     meter = pyln.Meter(rate)
     filters = getattr(meter, "_filters", None)
     if not filters:
-        return None
+        return None, None
     x = data.astype(np.float64)
     if x.ndim == 1:
         x = x[:, None]
     for f in filters.values():
         x = f.apply_filter(x)
-    nch = x.shape[1]
-    g = np.array([1.0, 1.0, 1.0, 1.41, 1.41])[:nch]
-    win, hop = int(3.0 * rate), int(1.0 * rate)
-    if win <= 0 or x.shape[0] < win:
-        return None
-    loud = []
+    g = np.array([1.0, 1.0, 1.0, 1.41, 1.41])[:x.shape[1]]
+    return x, g
+
+
+def _windowed_loudness(x, g, rate, win_s, hop_s):
+    """K 加权信号上的滑窗响度序列 (LUFS)。返回 (窗起点秒, 数值) 两列表。"""
+    import numpy as np
+    win, hop = int(win_s * rate), int(hop_s * rate)
+    if win <= 0 or hop <= 0 or x.shape[0] < win:
+        return [], []
+    times, values = [], []
     for s in range(0, x.shape[0] - win + 1, hop):
         seg = x[s:s + win]
         z = float(np.sum(g * np.mean(seg ** 2, axis=0)))
         if z > 0:
-            loud.append(-0.691 + 10 * np.log10(z))
-    loud = np.array([v for v in loud if v >= -70.0])  # absolute gate
+            times.append(s / rate)
+            values.append(-0.691 + 10 * np.log10(z))
+    return times, values
+
+
+def _lra_from_series(short_term):
+    """EBU R128 / Tech 3342 loudness range：short-term 序列门限后的 P95-P10。"""
+    import numpy as np
+    loud = np.array([v for v in short_term if v >= -70.0])   # absolute gate
     if loud.size < 2:
         return None
     rel = 10 * np.log10(np.mean(10 ** (loud / 10.0))) - 20.0  # relative gate
@@ -486,10 +514,17 @@ tool(
 
 tool(
     "measure_loudness",
-    "Fast loudness-only measurement of an audio file: integrated LUFS, "
-    "loudness range (LU), true peak (dBTP) and sample peak (dB). Lighter than "
-    "analyze_audio (skips tempo/key/spectral). Use for quick master-bus "
-    "loudness checks against a target (e.g. -14 LUFS).",
+    "Loudness measurement across the three BS.1770 time scales: "
+    "integrated_lufs (whole-file, gated -- what streaming normalization "
+    "reads), short_term_max_lufs + short_term_series (3s windows -- answers "
+    "'is the chorus too hot / at which second', series points are "
+    "[window_start_s, lufs]), momentary_max_lufs (400ms -- single-hit "
+    "spikes), plus loudness_range_lu (LRA), true peak (dBTP) and sample "
+    "peak. TERMINOLOGY: measuring a rendered SEGMENT gives that segment's "
+    "INTEGRATED loudness, not 'short-term' -- use short_term_series for "
+    "time-resolved views. Platform figures like -14 LUFS are normalization "
+    "REFERENCES, not mandatory delivery targets. Lighter than analyze_audio "
+    "(skips tempo/key/spectral).",
     obj({"path": {"type": "string"}}, ["path"]),
     lambda a: measure_loudness(a["path"]),
 )

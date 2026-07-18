@@ -31,6 +31,19 @@ def make_wav(path, seconds=3.0, rate=48000, freq=220.0):
     sf.write(path, stereo, rate, subtype="PCM_24")
 
 
+def make_burst_wav(path, rate=48000):
+    """12s 音频：安静段(0-6s, -23dB) + 响段(6-9s, -6dB) + 安静段(9-12s)。
+    用于验证 short-term 时间序列能定位"哪几秒过响"。"""
+    import numpy as np
+    import soundfile as sf
+    t = np.arange(int(12.0 * rate)) / rate
+    sig = 0.07 * np.sin(2 * np.pi * 220.0 * t)
+    burst = (t >= 6.0) & (t < 9.0)
+    sig[burst] = 0.5 * np.sin(2 * np.pi * 220.0 * t[burst])
+    stereo = np.stack([sig, sig], axis=1).astype(np.float32)
+    sf.write(path, stereo, rate, subtype="PCM_24")
+
+
 def rpc(proc, msg):
     proc.stdin.write(json.dumps(msg) + "\n")
     proc.stdin.flush()
@@ -83,6 +96,30 @@ def main():
               isinstance(ld["true_peak_dbtp"], (int, float))
               and ld["true_peak_dbtp"] > -3.0,
               f"(TP={ld['true_peak_dbtp']})")
+
+        # measure_loudness: BS.1770 三时间尺度（burst 定位）
+        burst = os.path.join(os.path.dirname(wav), "burst.wav")
+        make_burst_wav(burst)
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 31, "method": "tools/call",
+                       "params": {"name": "measure_loudness",
+                                  "arguments": {"path": burst}}})
+        ld = json.loads(r["result"]["content"][0]["text"])["loudness"]
+        st = ld.get("short_term_series") or {}
+        points = st.get("points") or []
+        check("loudness scales: short_term_max >= integrated",
+              isinstance(ld["short_term_max_lufs"], (int, float))
+              and ld["short_term_max_lufs"] >= ld["integrated_lufs"] - 0.5,
+              f"(st={ld['short_term_max_lufs']} int={ld['integrated_lufs']})")
+        check("loudness scales: momentary_max >= short_term_max",
+              isinstance(ld["momentary_max_lufs"], (int, float))
+              and ld["momentary_max_lufs"] >= ld["short_term_max_lufs"] - 0.5,
+              f"(mom={ld['momentary_max_lufs']})")
+        check("loudness scales: series covers the file",
+              len(points) >= 8 and st.get("window_s") == 3.0,
+              f"(points={len(points)})")
+        peak_t = max(points, key=lambda p: p[1])[0] if points else -1
+        check("loudness scales: series localizes the 6-9s burst",
+              5.0 <= peak_t <= 7.0, f"(peak window starts at {peak_t}s)")
 
         # analyze_audio
         r = rpc(proc, {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
