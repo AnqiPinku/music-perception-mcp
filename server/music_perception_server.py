@@ -408,37 +408,58 @@ def _llm_native(path, key, model, prompt, _base=None):
 
 
 # --------------------------------------------------------------------------
-# Audio -> MIDI  (monophonic, librosa pyin -- deterministic, offline)
+# Audio -> MIDI  (ROSVOT neural SVT when vendored; librosa pyin fallback)
 # --------------------------------------------------------------------------
-def transcribe_melody(path, bpm=None, quantize_beats=0.0, min_note_ms=80,
-                      start_seconds=0.0, max_seconds=0.0):
-    """Monophonic pitch tracking -> note list in BEATS, ready for a DAW MIDI tool.
+_ROSVOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "vendor", "ROSVOT")
 
-    start_seconds/max_seconds 支持分段转录超长音频（0 = 整段）。输出的
-    start_beats 以被转录片段的开头为 0，agent 写回 DAW 时自行加偏移。
+
+def _rosvot_available():
+    return (not os.environ.get("MPS_DISABLE_ROSVOT")
+            and os.path.exists(os.path.join(_ROSVOT_DIR, "checkpoints",
+                                            "rosvot", "model.pt")))
+
+
+def _rosvot_transcribe(wav_path):
+    """Vendored ROSVOT (ACL 2024, MIT) -> [(pitch, onset_s, dur_s)] or None.
+
+    Runs as a subprocess so torch/matplotlib stay out of the server process;
+    any failure returns None and the caller falls back to pyin.
     """
+    import shutil
+    import subprocess
+    import tempfile
+    out_dir = tempfile.mkdtemp(prefix="rosvot_")
+    try:
+        env = dict(os.environ, PYTHONPATH=".")
+        r = subprocess.run(
+            [sys.executable, os.path.join("inference", "rosvot.py"),
+             "-o", out_dir, "-p", os.path.abspath(wav_path)],
+            cwd=os.path.abspath(_ROSVOT_DIR), env=env,
+            capture_output=True, text=True, timeout=600)
+        midi_fn = os.path.join(out_dir, "midi", "output.mid")
+        if r.returncode != 0 or not os.path.exists(midi_fn):
+            return None
+        import pretty_midi
+        pm = pretty_midi.PrettyMIDI(midi_fn)
+        raw = [(int(n.pitch), float(n.start), float(n.end - n.start))
+               for inst in pm.instruments for n in inst.notes]
+        raw.sort(key=lambda x: x[1])
+        return raw or None
+    except Exception:  # noqa: BLE001 -- fall back to pyin on any failure
+        return None
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def _pyin_notes(mono, rate, min_note_ms):
+    """Legacy path: pyin f0 tracking + median segmentation -> [(pitch, onset_s, dur_s)]."""
     import numpy as np
     import librosa
-    data, rate = _load(path)
-    mono = data.mean(axis=1).astype(np.float32)
-    if start_seconds:
-        mono = mono[int(float(start_seconds) * rate):]
-    if max_seconds:
-        mono = mono[: int(float(max_seconds) * rate)]
-    if mono.size < rate // 10:
-        raise ValueError("selected segment is empty or shorter than 0.1s")
-    if rate != 16000:                          # 16k + hop512：精度够、比 22k/256 快 ~3 倍
-        mono = librosa.resample(mono, orig_sr=rate, target_sr=16000)
-        rate = 16000
-    if not bpm:
-        t, _ = librosa.beat.beat_track(y=mono, sr=rate)
-        bpm = float(np.atleast_1d(t)[0]) or 120.0
-    bpm = float(bpm)
     hop = 512                                  # 32ms 帧移，120BPM 十六分=125ms，足够
     f0, voiced, _ = librosa.pyin(
         mono, fmin=float(librosa.note_to_hz("C1")),
         fmax=float(librosa.note_to_hz("C7")), sr=rate, hop_length=hop)
-    rms = librosa.feature.rms(y=mono, hop_length=hop)[0]
     times = librosa.frames_to_time(np.arange(len(f0)), sr=rate, hop_length=hop)
     midi_f = librosa.hz_to_midi(np.where(np.isfinite(f0), f0, 1.0))
     ok = np.asarray(voiced) & np.isfinite(f0)
@@ -456,17 +477,84 @@ def transcribe_melody(path, bpm=None, quantize_beats=0.0, min_note_ms=80,
         if j - i >= min_frames:
             segs.append((i, j))
         i = j
-    notes = []
-    if segs:
-        seg_db = [20 * np.log10(float(rms[a:b].mean()) + 1e-9) for a, b in segs]
-        lo, hi = min(seg_db), max(seg_db)
+    raw = []
+    for a, b in segs:
+        pitch = int(round(float(np.median(midi_f[a:b]))))
+        onset = float(times[a])
+        dur = float(times[min(b, n - 1)]) - onset
+        raw.append((pitch, onset, dur))
+    return raw
+
+
+def transcribe_melody(path, bpm=None, quantize_beats=0.0, min_note_ms=80,
+                      start_seconds=0.0, max_seconds=0.0):
+    """Monophonic singing/melody -> note list in BEATS, ready for a DAW MIDI tool.
+
+    Primary backend: vendored ROSVOT (neural, robust to real voices); falls
+    back to the deterministic pyin path when the vendor dir or its deps are
+    missing (set MPS_DISABLE_ROSVOT=1 to force the fallback).
+
+    start_seconds/max_seconds 支持分段转录超长音频（0 = 整段）。输出的
+    start_beats 以被转录片段的开头为 0，agent 写回 DAW 时自行加偏移。
+    """
+    import numpy as np
+    import librosa
+    data, rate = _load(path)
+    mono = data.mean(axis=1).astype(np.float32)
+    if start_seconds:
+        mono = mono[int(float(start_seconds) * rate):]
+    if max_seconds:
+        mono = mono[: int(float(max_seconds) * rate)]
+    if mono.size < rate // 10:
+        raise ValueError("selected segment is empty or shorter than 0.1s")
+    mono16 = (librosa.resample(mono, orig_sr=rate, target_sr=16000)
+              if rate != 16000 else mono)
+    if not bpm:
+        t, _ = librosa.beat.beat_track(y=mono16, sr=16000)
+        bpm = float(np.atleast_1d(t)[0]) or 120.0
+    bpm = float(bpm)
+
+    method = "librosa.pyin (monophonic)"
+    raw = None
+    if _rosvot_available():
+        seg_path, tmp_seg = os.path.abspath(path), None
+        if start_seconds or max_seconds:       # ROSVOT 吃整个文件，分段就落盘临时 wav
+            import tempfile
+            import soundfile as sf
+            fd, tmp_seg = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            sf.write(tmp_seg, mono, rate)
+            seg_path = tmp_seg
+        try:
+            raw = _rosvot_transcribe(seg_path)
+        finally:
+            if tmp_seg:
+                os.unlink(tmp_seg)
+        if raw:
+            method = "rosvot (neural, vendored)"
+    if raw is None:
+        raw = _pyin_notes(mono16, 16000, min_note_ms)
+
+    # 公共后处理：时长过滤、拍换算、量化、按 RMS 赋力度
+    total_s = mono16.size / 16000.0
+    hop = 512
+    rms = librosa.feature.rms(y=mono16, hop_length=hop)[0]
+    raw = [(p, o, d) for p, o, d in raw
+           if 0 <= p <= 127 and d * 1000.0 >= min_note_ms]
+    notes, covered = [], 0.0
+    if raw:
+        db_list = []
+        for _, onset, dur in raw:
+            a = int(onset * 16000 / hop)
+            b = max(a + 1, int((onset + dur) * 16000 / hop))
+            db_list.append(20 * np.log10(float(rms[a:b].mean()) + 1e-9)
+                           if a < len(rms) else -60.0)
+        lo, hi = min(db_list), max(db_list)
         span = (hi - lo) or 1.0
-        for (a, b), db in zip(segs, seg_db):
-            pitch = int(round(float(np.median(midi_f[a:b]))))
-            if not 0 <= pitch <= 127:
-                continue
-            start_b = float(times[a]) * bpm / 60.0
-            len_b = (float(times[min(b, n - 1)]) - float(times[a])) * bpm / 60.0
+        for (pitch, onset, dur), db in zip(raw, db_list):
+            covered += dur
+            start_b = onset * bpm / 60.0
+            len_b = dur * bpm / 60.0
             if quantize_beats:                 # 吸附到节拍网格(如 0.25 = 十六分)
                 q = float(quantize_beats)
                 start_b = round(start_b / q) * q
@@ -477,8 +565,8 @@ def transcribe_melody(path, bpm=None, quantize_beats=0.0, min_note_ms=80,
                           "velocity": int(round(64 + 48 * (db - lo) / span))})
     return {"file": os.path.abspath(path), "bpm_used": round(bpm, 1),
             "note_count": len(notes), "notes": notes[:1000],
-            "voiced_pct": round(float(ok.mean()) * 100, 1),
-            "method": "librosa.pyin (monophonic)",
+            "voiced_pct": round(min(covered / total_s, 1.0) * 100, 1),
+            "method": method,
             "note": "single-voice melody/bass only -- chords and drums will "
                     "come out wrong; pass the DAW project BPM so beats line up"}
 
