@@ -5,6 +5,7 @@ venv/
 *.wav
 *.flac
 *.mp3
+*.ogg
 tmp/
 data/tmp/
 vendor/
