@@ -634,14 +634,17 @@ tool(
 tool(
     "transcribe_melody",
     "Transcribe a MONOPHONIC audio file (melody, bassline, hummed idea, single "
-    "synth line) into MIDI-ready notes via deterministic pitch tracking "
-    "(librosa pyin). Returns notes as {pitch, start_beats, length_beats, "
-    "velocity} -- the exact shape reaper-mcp's add_midi_notes expects, so you "
-    "can write them straight into a track. Pass bpm = the DAW project tempo "
-    "so beat positions line up (otherwise tempo is auto-detected). Optional "
-    "quantize_beats snaps to a grid (0.25 = 16th notes; 0 = off). NOT for "
-    "chords, polyphony or drums -- results will be wrong. Speed: roughly 1s "
-    "per 5s of audio; for files over ~3 minutes transcribe in segments with "
+    "synth line) into MIDI-ready notes. Primary backend: vendored ROSVOT "
+    "neural transcription (RMVPE pitch extraction, robust to real singing); "
+    "falls back to deterministic librosa pyin if the ROSVOT checkpoint is "
+    "missing or MPS_DISABLE_ROSVOT=1 -- the 'method' field in the result "
+    "names the backend used. Returns notes as {pitch, start_beats, "
+    "length_beats, velocity} -- the exact shape reaper-mcp's add_midi_notes "
+    "expects, so you can write them straight into a track. Pass bpm = the DAW "
+    "project tempo so beat positions line up (otherwise tempo is "
+    "auto-detected). Optional quantize_beats snaps to a grid (0.25 = 16th "
+    "notes; 0 = off). NOT for chords, polyphony or drums -- results will be "
+    "wrong. For files over ~3 minutes transcribe in segments with "
     "start_seconds/max_seconds (start_beats restarts at 0 for each segment -- "
     "offset them yourself when writing to the DAW).",
     obj({"path": {"type": "string"},
