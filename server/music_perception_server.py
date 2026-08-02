@@ -571,6 +571,18 @@ def transcribe_melody(path, bpm=None, quantize_beats=0.0, min_note_ms=80,
                     "come out wrong; pass the DAW project BPM so beats line up"}
 
 
+def perception_info():
+    """Cheap status probe: which melody-transcription backend is live.
+
+    No audio, no torch import, no subprocess -- only the vendored-checkpoint
+    availability check, so a UI can show whether transcribe_melody will run
+    ROSVOT or fall back to pyin without paying for a real transcription.
+    """
+    avail = bool(_rosvot_available())        # 只做存在性检查，绝不 import torch / 起子进程
+    return {"transcribe_backend": "rosvot" if avail else "pyin",
+            "rosvot_available": avail}
+
+
 # --------------------------------------------------------------------------
 # Tool registry
 # --------------------------------------------------------------------------
@@ -658,6 +670,18 @@ tool(
                                 a.get("min_note_ms") or 80,
                                 a.get("start_seconds") or 0.0,
                                 a.get("max_seconds") or 0.0),
+)
+
+tool(
+    "perception_info",
+    "Report which melody-transcription backend transcribe_melody will use, "
+    "without doing any work. Returns {transcribe_backend: 'rosvot' | 'pyin', "
+    "rosvot_available: bool}: 'rosvot' means the vendored neural checkpoint is "
+    "present and will be used; 'pyin' means it will fall back to the "
+    "deterministic librosa path (checkpoint missing or MPS_DISABLE_ROSVOT set). "
+    "Cheap status check -- no audio decode, no torch import, no subprocess.",
+    obj({}),
+    lambda a: perception_info(),
 )
 
 TOOL_INDEX = {t["name"]: t for t in TOOLS}

@@ -78,8 +78,9 @@ def main():
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = {t["name"] for t in r["result"]["tools"]}
-        check("tools/list has analyze_audio + measure_loudness + listen_subjective",
-              {"analyze_audio", "measure_loudness", "listen_subjective"} <= names)
+        check("tools/list has the analysis tools + perception_info",
+              {"analyze_audio", "measure_loudness", "listen_subjective",
+               "perception_info"} <= names)
 
         # measure_loudness
         r = rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -159,6 +160,17 @@ def main():
         body = json.loads(r["result"]["content"][0]["text"])
         check("listen_subjective without key -> configured:false",
               body.get("configured") is False)
+
+        # perception_info: cheap backend status (no torch / no subprocess)
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                       "params": {"name": "perception_info", "arguments": {}}})
+        info = json.loads(r["result"]["content"][0]["text"])
+        check("perception_info: rosvot_available is a bool",
+              isinstance(info.get("rosvot_available"), bool),
+              f"(avail={info.get('rosvot_available')})")
+        check("perception_info: backend is 'rosvot' or 'pyin'",
+              info.get("transcribe_backend") in ("rosvot", "pyin"),
+              f"(backend={info.get('transcribe_backend')})")
 
     finally:
         proc.stdin.close()
